@@ -1364,7 +1364,7 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
                 "Enable pipelinling of reduce-scatter instructions."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_enable_pipelined_p2p",
-      bool_setter_for(&DebugOptions::set_xla_gpu_enable_pipelined_p2p),
+      int32_setter_for(&DebugOptions::set_xla_gpu_enable_pipelined_p2p),
       debug_options->xla_gpu_enable_pipelined_p2p(),
       "Enable pipelinling of P2P instructions."));
   flag_list->push_back(tsl::Flag(
