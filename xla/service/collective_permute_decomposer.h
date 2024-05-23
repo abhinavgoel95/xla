@@ -54,8 +54,10 @@ namespace xla {
 //
 class CollectivePermuteDecomposer : public HloModulePass {
  public:
-  explicit CollectivePermuteDecomposer(int64_t threshold_in_bytes)
-      : threshold_in_bytes_(threshold_in_bytes) {}
+  explicit CollectivePermuteDecomposer(int64_t threshold_in_bytes,
+                                       int32_t pipeline_method)
+      : threshold_in_bytes_(threshold_in_bytes),
+        pipeline_method_(pipeline_method) {}
   absl::string_view name() const override {
     return "collective-permute-decomposer";
   }
