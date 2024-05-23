@@ -72,6 +72,7 @@ class CollectivePermuteDecomposer : public HloModulePass {
  private:
   // Transform only if the size of the collective permute is >= threshold.
   int64_t threshold_in_bytes_;
+  int32_t pipeline_method_;
 };
 
 }  // namespace xla
