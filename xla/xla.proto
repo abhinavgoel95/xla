@@ -1175,6 +1175,9 @@ message DebugOptions {
 
   bool xla_pjrt_allow_auto_layout_in_hlo = 344;
 
+  // A pbtxt file path that specifies latency hiding scheduler constraints.
+  string xla_gpu_scheduling_constraints_file = 400;
+
   // If false, platform_util::GetDefaultPlatform() will return an error. Used as
   // a safeguard for tests where GetDefaultPlatform() won't work properly and
   // its use indicates an error in test setup.

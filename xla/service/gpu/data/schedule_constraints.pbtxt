@@ -1,0 +1,8 @@
+constraints {
+    collective_name: "ar-done"
+    compute_names: "dot2"
+}
+constraints {
+    collective_name: "ar-done1"
+    compute_names: "dot5"
+}

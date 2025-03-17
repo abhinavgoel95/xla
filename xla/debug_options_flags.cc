@@ -2231,6 +2231,7 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       "Internal: Enable the RaggedAllToAllDecomposer, an experimental pass "
       "that rewrites ragged-all-to-all as a dense all-to-all operation."));
   flag_list->push_back(tsl::Flag(
+<<<<<<< ours
       "xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel",
       bool_setter_for(
           &DebugOptions::
@@ -2239,6 +2240,14 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
           ->xla_gpu_unsupported_use_ragged_all_to_all_one_shot_kernel(),
       "Internal: Enable the one-shot kernel for single-host ragged-all-to-all "
       "operations."));
+=======
+      "xla_gpu_scheduling_constraints_file",
+      string_setter_for(&DebugOptions::set_xla_gpu_scheduling_constraints_file),
+      debug_options->xla_gpu_scheduling_constraints_file(),
+      "Path to a file specify the latency hiding scheduling constraint. "
+      "The constraints are soft constraints that the LHS will respect when "
+      "conditions allow. "));
+>>>>>>> theirs
   flag_list->push_back(tsl::Flag(
       "xla_gpu_experimental_enable_alltoall_windowed_einsum",
       bool_setter_for(

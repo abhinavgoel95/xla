@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package xla;
+
+// Defines a soft constraint for overlapping collectives.
+message HloScheduleConstraint {
+  // An collective op that needs to be overlapped with.
+  string collective_name = 1;
+
+  // A list of compute candidates that this collective can overlap with.
+  repeated string compute_names = 2;
+}
+
+message HloScheduleConstraints {
+  repeated HloScheduleConstraint constraints = 1;
+}

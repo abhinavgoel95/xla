@@ -299,6 +299,13 @@ class AsyncTracker {
   // Returns whether the provided node occupies a selective resource.
   bool OccupiesSelectiveResource(const HloGraphNode* node) const;
 
+  // Returns the scheduling constraints for a given op.
+  // The scheduler will try its best effort to respect the schedule constraints
+  // when it schedules the input HLO, which means only when the constraints are
+  // present in the ready set, the input HLO will be scheduled.
+  virtual const absl::flat_hash_set<std::string>& GetScheduleConstraints(
+      const HloInstruction& hlo) const;
+
   inline CanonicalAsyncOp GetCanonicalAsyncOp(const HloInstruction& hlo) const {
     return get_canonical_async_op_(hlo);
   }
@@ -579,6 +586,16 @@ class HloGraphNode {
   }
   void AddSuccessor(const HloEdge& e) { successors_.push_back(e); }
   int64_t GetOriginalPosition() const { return original_position_; }
+  void AddPinnedComputeNode(HloGraphNode* node) {
+    pinned_compute_nodes_.push_back(node);
+  }
+  absl::Span<HloGraphNode* const> GetPinnedComputeNodes() const {
+    return absl::MakeSpan(pinned_compute_nodes_);
+  }
+  void SetPinnedAsyncNode(HloGraphNode* async_node) {
+    pinned_async_node_ = async_node;
+  }
+  HloGraphNode* GetPinnedAsyncNode() const { return pinned_async_node_; }
   int64_t GetAnnotation() const { return annotation_; }
   absl::Status SetAnnotation(int64_t annotation) {
     TF_RET_CHECK(annotation_ == -1)
@@ -669,6 +686,10 @@ class HloGraphNode {
   // Nums hops to closest selective resource occupier.
   int64_t num_hops_to_closest_selective_resource_occupier_ =
       std::numeric_limits<int64_t>::max();
+  // Manually pinned compute nodes for overlapping.
+  absl::InlinedVector<HloGraphNode*, 1> pinned_compute_nodes_;
+  // Manually pinned async node for overlapping.
+  HloGraphNode* pinned_async_node_ = nullptr;
   int64_t annotation_ = -1;
 };
 

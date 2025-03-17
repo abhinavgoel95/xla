@@ -18,11 +18,14 @@ limitations under the License.
 
 #include <cstdint>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/service/hlo_cost_analysis.h"
 #include "xla/service/latency_hiding_scheduler.h"
 #include "xla/service/profile_guided_latency_estimator.h"
+#include "xla/service/schedule_constraint.pb.h"
 #include "xla/shape.h"
 
 namespace xla {
@@ -75,6 +78,7 @@ class GpuAsyncTrackerBase : public AsyncTracker {
  public:
   explicit GpuAsyncTrackerBase(
       const SchedulerConfig& config,
+      const HloScheduleConstraints& schedule_constraints,
       GetCanonicalAsyncOpFunc func = GpuGetCanonicalAsyncOp);
 
   // Returns if this is an Async op done that the scheduler supports.
@@ -87,12 +91,20 @@ class GpuAsyncTrackerBase : public AsyncTracker {
   void PostProcessScheduleGraph(
       HloScheduleGraph* schedule_graph,
       const LatencyEstimator* latency_estimator) const override;
+
+  const absl::flat_hash_set<std::string>& GetScheduleConstraints(
+      const HloInstruction& hlo) const override;
+
+ private:
+  const absl::flat_hash_map<std::string, absl::flat_hash_set<std::string>>
+      schedule_constraints_;
 };
 
 // GPU async tracker maps all collectives onto an async stream resource.
 class GpuAsyncTracker : public GpuAsyncTrackerBase {
  public:
-  explicit GpuAsyncTracker(const SchedulerConfig& config);
+  explicit GpuAsyncTracker(const SchedulerConfig& config,
+                           const HloScheduleConstraints& schedule_constraints);
 
   // Returns resources used (occupied or released) by `instr`.
   ResourcesVector GetResourcesFromInstructionImpl(

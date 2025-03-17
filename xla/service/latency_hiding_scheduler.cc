@@ -595,6 +595,13 @@ bool AsyncTracker::OccupiesSelectiveResource(const HloGraphNode* node) const {
       });
 }
 
+const absl::flat_hash_set<std::string>& AsyncTracker::GetScheduleConstraints(
+    const HloInstruction& hlo) const {
+  // This feature is only supported in the gpu LHS so far.
+  static const absl::flat_hash_set<std::string> kEmptySet;
+  return kEmptySet;
+}
+
 BufferInfoTracker::BufferInfoTracker(
     const HloModule* module, const HloAliasAnalysis* alias_analysis,
     const HloCostAnalysis::ShapeSizeFunction& shape_size_bytes) {
@@ -1360,7 +1367,50 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
   }
   absl::InlinedVector<std::pair<HloGraphNode*, SkipNodeReason>, 2>
       skipped_nodes_and_reasons;
-  VLOG(2) << "Current time: " << sched_state.current_time;
+  if (!scheduling_instruction_crosses_overlap_limit_) {
+    scheduling_instruction_crosses_overlap_limit_ =
+        [](const SchedulingState& sched_state, const HloGraphNode* node) {
+          for (const auto& [resource, limit] :
+               sched_state.max_concurrent_resource) {
+            // No resources in flight of this kind. Continue.
+            auto it = sched_state.resource_occupiers_in_flight.find(resource);
+            if (it == sched_state.resource_occupiers_in_flight.end() ||
+                it->second.empty()) {
+              continue;
+            }
+            // Number of instances of 'resource' needed if this instruction was
+            // to be scheduled.
+            const int64_t num_resources_needed =
+                sched_state.async_tracker->GetNumResourcesPerInstruction(
+                    resource, node->GetInstr());
+            if (limit < num_resources_needed) {
+              return true;
+            }
+          }
+          return false;
+        };
+  }
+
+  VLOG(1) << "Current time: " << sched_state.current_time;
+
+  // Before we compare candidates, we might want to dynamically bump the
+  // priority of some.
+  absl::flat_hash_set<HloGraphNode*> ready_set = {sched_state.ready_set.begin(),
+                                                  sched_state.ready_set.end()};
+  for (auto* cand_node : sched_state.ready_set) {
+    auto pinned_nodes = cand_node->GetPinnedComputeNodes();
+    if (pinned_nodes.empty()) {
+      continue;
+    }
+    auto it = ready_set.find(pinned_nodes[0]);
+    if (it == ready_set.end()) {
+      continue;
+    }
+    // We pick the first ready pair to schedule.
+    cand_node->SetForceEarly(true);
+    break;
+  }
+
   ReadySetLt ready_lt{&sched_state, target_scheduling_rule_,
                       early_target_scheduling_rule_};
   // Construct a schedule candidate for caching.
@@ -1763,6 +1813,10 @@ std::vector<int64_t> GetPredecessorAnnotations(const HloGraphNode* node) {
 absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
     HloGraphNode* n, DefaultSchedulerCore::SchedulingState* sched_state) const {
   // Insert the node into the sequence and mark it as scheduled.
+  if (n->GetPinnedAsyncNode() != nullptr) {
+    CHECK(n->GetPinnedAsyncNode()->IsScheduled())
+        << "Manually pinned async node should be scheduled beforehand.";
+  }
   sched_state->new_sequence_reversed.push_back(
       const_cast<HloInstruction*>(&n->GetInstr()));
   n->SetScheduled();
@@ -2014,6 +2068,27 @@ absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
       }
     }
   }
+
+  HloGraphNode::TimeCost all_pinned_nodes_ready_time = 0.0;
+  for (auto* pinned_node : n->GetPinnedComputeNodes()) {
+    // If a manually-scheduled async node is scheduled, bumps its
+    // manually-pinned computes to be scheduled with highest priority.
+    pinned_node->SetForceEarly(true);
+    all_pinned_nodes_ready_time =
+        std::max(all_pinned_nodes_ready_time, pinned_node->GetReadyTime());
+  }
+  if (all_pinned_nodes_ready_time > 0.0 &&
+      async_tracker_->IsSupportedAsyncDone(n->GetInstr())) {
+    // Also, if this node is a done instruction, modifies the ready time
+    // of its corresponding start on the fly to make the start instruction
+    // scheduled right after the pinned node is scheduled, regardless
+    // of the cost model.
+    // TODO(yunlongl): Investigates whether +1.0 is necessary.
+    CHECK_EQ(n->GetPredecessors().size(), 1);
+    n->GetPredecessors()[0].Target().SetReadyTime(all_pinned_nodes_ready_time +
+                                                  1.0);
+  }
+
   VLOG(10) << "Memory pressure before schedule: "
            << sched_state->memory_pressure_tracker->memory_usage();
   VLOG(10)
@@ -2282,6 +2357,10 @@ void HloScheduleGraph::InitializeGraphAnalysis(
     const AsyncTracker* async_tracker) {
   absl::flat_hash_map<HloGraphNode*, int> current_rank;
   std::vector<HloGraphNode*> stack;
+
+  absl::flat_hash_set<HloGraphNode*> nodes_with_schedule_constraints;
+  absl::flat_hash_map<absl::string_view, HloGraphNode*>
+      compute_nodes_for_overlap;
   for (const HloInstruction* instr : original_order_) {
     HloGraphNode& node = GetNode(instr);
     current_rank[&node] = node.GetIndegree();
@@ -2291,7 +2370,18 @@ void HloScheduleGraph::InitializeGraphAnalysis(
     if (node.GetIndegree() == 0) {
       stack.push_back(&node);
     }
+
+    const auto& sched_constraints =
+        async_tracker->GetScheduleConstraints(*instr);
+    if (sched_constraints.empty()) {
+      continue;
+    }
+    nodes_with_schedule_constraints.insert(&node);
+    for (const std::string& instr_name : sched_constraints) {
+      compute_nodes_for_overlap.try_emplace(instr_name, nullptr);
+    }
   }
+
   while (!stack.empty()) {
     auto* node = stack.back();
     stack.pop_back();
@@ -2340,6 +2430,24 @@ void HloScheduleGraph::InitializeGraphAnalysis(
       if (--current_rank[&succ.Target()] == 0) {
         stack.push_back(&succ.Target());
       }
+    }
+
+    auto it = compute_nodes_for_overlap.find(node->GetInstr().name());
+    if (it != compute_nodes_for_overlap.end()) {
+      it->second = node;
+    }
+  }
+
+  for (auto* node : nodes_with_schedule_constraints) {
+    for (const auto& name :
+         async_tracker->GetScheduleConstraints(node->GetInstr())) {
+      auto it = compute_nodes_for_overlap.find(name);
+      if (it == compute_nodes_for_overlap.end() || it->second == nullptr) {
+        LOG(ERROR) << "Unable to find HloGraphNode for " << name;
+        continue;
+      }
+      node->AddPinnedComputeNode(it->second);
+      it->second->SetPinnedAsyncNode(node);
     }
   }
 }
@@ -2394,11 +2502,40 @@ absl::Status DefaultSchedulerCore::InitializeScheduler(
 
 absl::Status DefaultSchedulerCore::SchedulingStep(
     SchedulingState* sched_state) {
+  auto should_skip_node = [sched_state](const HloGraphNode* node) -> bool {
+    if (node->GetPinnedComputeNodes().empty() &&
+        node->GetPinnedAsyncNode() == nullptr) {
+      return false;
+    }
+    if (node->GetPinnedAsyncNode() != nullptr) {
+      if (node->GetPinnedAsyncNode()->IsScheduled()) {
+        return false;
+      }
+      return true;
+    }
+    auto pinned_nodes = node->GetPinnedComputeNodes();
+    CHECK_EQ(pinned_nodes.size(), 1) << "Only support one constraint.";
+    if (pinned_nodes[0]->IsScheduled()) {
+      // In this case, the compute nodes are ready before the async nodes.
+      // We should then allow the async done nodes to be scheduled asap.
+      LOG(ERROR) << "Node: " << node->GetInstr().name() << " has a constraint "
+                 << pinned_nodes[0]->GetInstr().name()
+                 << " coming ready before it.";
+      return false;
+    }
+    bool pinned_nodes_ready = false;
+    for (auto* ready_node : sched_state->ready_set) {
+      if (ready_node == pinned_nodes[0]) {
+        pinned_nodes_ready = true;
+        break;
+      }
+    }
+    return !pinned_nodes_ready;
+  };
   // Get the first available node for scheduling that is the node that
   // satisfies our ready heuristic the best.
-  TF_ASSIGN_OR_RETURN(HloGraphNode * node,
-                      FindAndExtractBestNodeAvailable(
-                          *sched_state, /*should_skip_node=*/nullptr));
+  TF_ASSIGN_OR_RETURN(HloGraphNode * node, FindAndExtractBestNodeAvailable(
+                                               *sched_state, should_skip_node));
   CHECK(node != nullptr);
   TF_ASSIGN_OR_RETURN(sched_state->current_time,
                       ScheduleNode(node, sched_state));

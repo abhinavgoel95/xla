@@ -54,6 +54,7 @@ limitations under the License.
 #include "xla/tests/hlo_test_base.h"
 #include "xla/tests/test_utils.h"
 #include "xla/tsl/lib/core/status_test_util.h"
+#include "tsl/platform/path.h"
 #include "tsl/platform/status.h"
 #include "tsl/platform/status_matchers.h"
 #include "tsl/platform/statusor.h"
@@ -406,6 +407,77 @@ TEST_F(GpuHloScheduleTest, LHSCostModel) {
   EXPECT_EQ(count_between_pairs.size(), 2);
   EXPECT_GT(count_between_pairs[0], 0);
   EXPECT_GT(count_between_pairs[1], 0);
+  EXPECT_TRUE(HasValidFingerprint(module.get()));
+}
+
+TEST_F(GpuHloScheduleTest, GpuScheduleConstraintsForDoneInstructions) {
+  const char* hlo_text = R"(
+  HloModule AsyncAR
+  apply_op {
+    x = f32[] parameter(0)
+    y = f32[] parameter(1)
+    ROOT apply_op = f32[] add(x, y)
+  }
+
+  ENTRY ar {
+    p0 = f32[32] parameter(0)
+    p1 = f32[32, 32] parameter(1)
+    p2 = f32[32, 32] parameter(2)
+    p3 = f32[32] parameter(3)
+
+    dot0 = f32[32,32]{1,0} custom-call(p1, p2), custom_call_target="__cublas$gemm"
+    dot1 = f32[32,32]{1,0} custom-call(dot0, p2), custom_call_target="__cublas$gemm"
+    dot2 = f32[32,32]{1,0} custom-call(dot1, p2), custom_call_target="__cublas$gemm"
+    dot3 = f32[32,32]{1,0} custom-call(dot2, p2), custom_call_target="__cublas$gemm"
+    dot4 = f32[32,32]{1,0} custom-call(dot3, p2), custom_call_target="__cublas$gemm"
+    dot5 = f32[32,32]{1,0} custom-call(dot4, p2), custom_call_target="__cublas$gemm"
+    dot6 = f32[32,32]{1,0} custom-call(dot5, p2), custom_call_target="__cublas$gemm"
+
+    ar-start = f32[32] all-reduce-start(p0), to_apply=apply_op
+    ar-done = f32[32] all-reduce-done(ar-start)
+
+    ar-start1 = f32[32] all-reduce-start(p3), to_apply=apply_op
+    ar-done1 = f32[32] all-reduce-done(ar-start1)
+
+    add0 = f32[32,32] add(dot0, dot1)
+    add1 = f32[32,32] add(add0, dot2)
+    add2 = f32[32,32] add(add1, dot3)
+    add3 = f32[32,32] add(add2, dot4)
+    add4 = f32[32,32] add(add3, dot5)
+    add5 = f32[32,32] add(add4, dot6)
+
+    ROOT t = (f32[32], f32[32], f32[32,32]) tuple(ar-done, ar-done1, add5)
+  })";
+
+  TestConfig test_config;
+  test_config.enable_latency_hiding_scheduler = true;
+  auto module_config = GetModuleConfig(test_config);
+  auto debug_options = module_config.debug_options();
+  debug_options.set_xla_gpu_scheduling_constraints_file(
+      tsl::io::JoinPath(tsl::testing::XlaSrcRoot(), "service", "gpu", "data",
+                        "schedule_constraints.pbtxt"));
+  module_config.set_debug_options(debug_options);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto module, ParseAndReturnVerifiedModule(hlo_text, module_config));
+
+  SequentialHloOrdering order = BuildHloOrdering(module.get());
+
+  // Manually pinned schedule disregards all cost model results.
+  HloComputation* entry = module->entry_computation();
+  auto* ar_done_1 = entry->GetInstructionWithName("ar-done1");
+  auto* dot5 = entry->GetInstructionWithName("dot5");
+  auto* ar_start_1 = entry->GetInstructionWithName("ar-start1");
+
+  auto* ar_done = entry->GetInstructionWithName("ar-done");
+  auto* dot2 = entry->GetInstructionWithName("dot2");
+  auto* ar_start = entry->GetInstructionWithName("ar-start");
+
+  EXPECT_TRUE(order.ExecutesBefore(ar_start, dot2));
+  EXPECT_TRUE(order.ExecutesBefore(dot2, ar_done));
+
+  EXPECT_TRUE(order.ExecutesBefore(ar_start_1, dot5));
+  EXPECT_TRUE(order.ExecutesBefore(dot5, ar_done_1));
   EXPECT_TRUE(HasValidFingerprint(module.get()));
 }
 

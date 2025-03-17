@@ -85,6 +85,12 @@ tf_proto_library(
     visibility = ["//visibility:public"],
 )
 
+tf_proto_library(
+    name = "schedule_constraint_proto",
+    srcs = ["schedule_constraint.proto"],
+    visibility = ["//visibility:public"],
+)
+
 xla_py_proto_library(
     name = "metrics_pb2",
     deps = [":metrics_proto"],

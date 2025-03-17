@@ -50,6 +50,8 @@ limitations under the License.
 #include "xla/hlo/transforms/simplifiers/hlo_memory_scheduler.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/buffer_value.h"
+#include "xla/service/collective_ops_utils.h"
+#include "xla/service/schedule_constraint.pb.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/flag_utils.h"
 #include "xla/service/gpu/gpu_latency_hiding_scheduler.h"
@@ -356,6 +358,39 @@ ProfiledInstructionsProto FilterWithFingerprint(
   return merged_result;
 }
 
+std::optional<HloScheduleConstraints> ReadScheduleConstraints(
+    const HloModule* module) {
+  HloScheduleConstraints constraints;
+
+  const std::string& schedule_constraints_path =
+      module->config().debug_options().xla_gpu_scheduling_constraints_file();
+  if (schedule_constraints_path.empty()) {
+    return std::nullopt;
+  }
+
+  auto extension = tsl::io::Extension(schedule_constraints_path);
+  if (extension != "pbtxt") {
+    LOG(ERROR) << "Unable to read schedule constraint text proto from "
+               << schedule_constraints_path;
+    return std::nullopt;
+  }
+
+  tsl::Env* env = tsl::Env::Default();
+  if (env->FileExists(schedule_constraints_path).ok()) {
+    absl::Status s =
+        tsl::ReadTextProto(env, schedule_constraints_path, &constraints);
+    if (s.ok()) {
+      LOG(INFO) << "Using schedule constraints from "
+                << schedule_constraints_path;
+      return constraints;
+    } else {
+      LOG(ERROR) << "Unable to read schedule constraints text proto from "
+                 << schedule_constraints_path << ": " << s.message();
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<ProfiledInstructionsProto> ProfileFromConfig(
     const HloModuleConfig& config) {
   if (config.fdo_profile().empty()) {
@@ -583,7 +618,17 @@ absl::Status RunLatencyHidingSchedulerPasses(
         dynamic_cast<ProfileGuidedLatencyEstimator&>(*estimator));
   }
 
-  auto async_tracker = std::make_unique<GpuAsyncTracker>(config);
+  std::optional<HloScheduleConstraints> sched_constraints =
+      ReadScheduleConstraints(module);
+  if (sched_constraints.has_value()) {
+    LOG(INFO) << "Found schedule constraints:\n"
+              << sched_constraints->DebugString();
+  }
+
+  HloScheduleConstraints constraints = sched_constraints.has_value()
+                                           ? std::move(*sched_constraints)
+                                           : HloScheduleConstraints();
+  auto async_tracker = std::make_unique<GpuAsyncTracker>(config, constraints);
   auto scheduler_core = std::make_unique<DefaultSchedulerCore>(
       shape_size_in_bytes, async_tracker.get(), estimator.get(), config,
       /*target_scheduling_rule=*/nullptr,

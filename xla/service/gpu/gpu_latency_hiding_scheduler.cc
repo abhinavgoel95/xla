@@ -22,6 +22,8 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -35,6 +37,7 @@ limitations under the License.
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/transforms/collectives/collective_ops_utils.h"
 #include "xla/service/latency_hiding_scheduler.h"
+#include "xla/service/schedule_constraint.pb.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 
@@ -262,9 +265,22 @@ bool GpuScheduleCrossesOverlapLimit(
 //===----------------------------------------------------------------------===//
 // GpuAsyncTrackerBase
 //===----------------------------------------------------------------------===//
-GpuAsyncTrackerBase::GpuAsyncTrackerBase(const SchedulerConfig& config,
-                                         GetCanonicalAsyncOpFunc func)
-    : AsyncTracker(config, func) {}
+GpuAsyncTrackerBase::GpuAsyncTrackerBase(
+    const SchedulerConfig& config,
+    const HloScheduleConstraints& schedule_constraints,
+    GetCanonicalAsyncOpFunc func)
+    : AsyncTracker(config, func),
+      schedule_constraints_([&schedule_constraints] {
+        absl::flat_hash_map<std::string, absl::flat_hash_set<std::string>>
+            constraints;
+        for (const HloScheduleConstraint& constraint :
+             schedule_constraints.constraints()) {
+          constraints[constraint.collective_name()] = {
+              constraint.compute_names().begin(),
+              constraint.compute_names().end()};
+        }
+        return constraints;
+      }()) {}
 
 bool GpuAsyncTrackerBase::IsSupportedAsyncDone(
     const HloInstruction& hlo) const {
@@ -341,11 +357,24 @@ void GpuAsyncTrackerBase::PostProcessScheduleGraph(
   }
 }
 
+const absl::flat_hash_set<std::string>&
+GpuAsyncTrackerBase::GetScheduleConstraints(const HloInstruction& hlo) const {
+  auto it = schedule_constraints_.find(hlo.name());
+  if (it == schedule_constraints_.end()) {
+    return AsyncTracker::GetScheduleConstraints(hlo);
+  }
+
+  LOG(INFO) << "Found schedule constraint for HLO instruction: " << hlo.name();
+  return it->second;
+}
+
 //===----------------------------------------------------------------------===//
 // GpuAsyncTracker
 //===----------------------------------------------------------------------===//
-GpuAsyncTracker::GpuAsyncTracker(const SchedulerConfig& config)
-    : GpuAsyncTrackerBase(config) {}
+GpuAsyncTracker::GpuAsyncTracker(
+    const SchedulerConfig& config,
+    const HloScheduleConstraints& sched_constraints)
+    : GpuAsyncTrackerBase(config, sched_constraints) {}
 
 static bool IsAnnotatedForGpuAsyncStreamCollectivesP2P(
     const HloInstruction& instr) {
