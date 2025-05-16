@@ -1,0 +1,362 @@
+From 4210019a98f44b72d25ef386e995e34921ff1d5f Mon Sep 17 00:00:00 2001
+From: Johannes Reifferscheid <jreiffers@nvidia.com>
+Date: Thu, 15 May 2025 14:57:38 +0200
+Subject: [PATCH] Sink scalar constants into fusions after while loop
+ optmization.
+
+Currently, while double buffering leaves fusions that have scalar
+parameters that are just constants. Normally, such constants are
+always fused by priority fusion. Having these constants as parameters
+inhibits optimization. This change introduces a new pass that copies
+such constants into fusions and removes the parameters. The same
+goal could be achieved by running double buffering before fusion, but
+that likely has a significant impact on compilation time.
+---
+ xla/service/gpu/BUILD                         |   1 +
+ xla/service/gpu/gpu_compiler.cc               |   2 +
+ xla/service/gpu/transforms/BUILD              |  29 ++++
+ .../gpu/transforms/scalar_constant_sinker.cc  |  71 ++++++++++
+ .../gpu/transforms/scalar_constant_sinker.h   |  46 +++++++
+ .../transforms/scalar_constant_sinker_test.cc | 130 ++++++++++++++++++
+ 6 files changed, 279 insertions(+)
+ create mode 100644 xla/service/gpu/transforms/scalar_constant_sinker.cc
+ create mode 100644 xla/service/gpu/transforms/scalar_constant_sinker.h
+ create mode 100644 xla/service/gpu/transforms/scalar_constant_sinker_test.cc
+
+diff --git a/xla/service/gpu/BUILD b/xla/service/gpu/BUILD
+index 13c1f4cc4143d..ed278b13fad59 100644
+--- a/xla/service/gpu/BUILD
++++ b/xla/service/gpu/BUILD
+@@ -1533,6 +1533,7 @@ cc_library(
+         "//xla/service/gpu/transforms:reduction_splitter",
+         "//xla/service/gpu/transforms:rename_fusions",
+         "//xla/service/gpu/transforms:sanitize_constant_names",
++        "//xla/service/gpu/transforms:scalar_constant_sinker",
+         "//xla/service/gpu/transforms:scatter_expander",
+         "//xla/service/gpu/transforms:scatter_slice_simplifier",
+         "//xla/service/gpu/transforms:softmax_rewriter_triton",
+diff --git a/xla/service/gpu/gpu_compiler.cc b/xla/service/gpu/gpu_compiler.cc
+index 5d1313dba33ae..562157f174de4 100644
+--- a/xla/service/gpu/gpu_compiler.cc
++++ b/xla/service/gpu/gpu_compiler.cc
+@@ -228,6 +228,7 @@ limitations under the License.
+ #include "xla/service/gpu/transforms/reduction_splitter.h"
+ #include "xla/service/gpu/transforms/rename_fusions.h"
+ #include "xla/service/gpu/transforms/sanitize_constant_names.h"
++#include "xla/service/gpu/transforms/scalar_constant_sinker.h"
+ #include "xla/service/gpu/transforms/scatter_expander.h"
+ #include "xla/service/gpu/transforms/scatter_slice_simplifier.h"
+ #include "xla/service/gpu/transforms/softmax_rewriter_triton.h"
+@@ -1169,6 +1170,7 @@ void AddDoubleBufferingPasses(const HloModule& module,
+     pipeline.AddPass<DoubleBufferLoopUnrolling>(*unroll_strategy);
+     pipeline.AddPass<TupleSimplifier>();
+     pipeline.AddPass<HloDCE>();
++    pipeline.AddPass<ScalarConstantSinker>();
+   }
+ }
+ 
+diff --git a/xla/service/gpu/transforms/BUILD b/xla/service/gpu/transforms/BUILD
+index 292a0a14e5fbd..801845f778f1c 100644
+--- a/xla/service/gpu/transforms/BUILD
++++ b/xla/service/gpu/transforms/BUILD
+@@ -2676,6 +2676,35 @@ xla_cc_test(
+     ],
+ )
+ 
++cc_library(
++    name = "scalar_constant_sinker",
++    srcs = ["scalar_constant_sinker.cc"],
++    hdrs = ["scalar_constant_sinker.h"],
++    deps = [
++        "//xla/hlo/ir:hlo",
++        "//xla/hlo/pass:hlo_pass",
++        "//xla/service:name_uniquer",
++        "@com_google_absl//absl/container:flat_hash_set",
++        "@com_google_absl//absl/status:statusor",
++        "@com_google_absl//absl/strings:string_view",
++        "@tsl//tsl/platform:errors",
++    ],)
++
++xla_cc_test(
++    name = "scalar_constant_sinker_test",
++    srcs = ["scalar_constant_sinker_test.cc"],
++    deps = [
++        ":scalar_constant_sinker",
++        "//xla:literal_util",
++        "//xla/hlo/ir:hlo",
++        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
++        "//xla/hlo/testlib:pattern_matcher_gmock",
++        "//xla/tests:xla_internal_test_main",
++        "@tsl//tsl/platform:statusor",
++        "@tsl//tsl/platform:test",
++    ],
++)
++
+ cc_library(
+     name = "scatter_slice_simplifier",
+     srcs = ["scatter_slice_simplifier.cc"],
+diff --git a/xla/service/gpu/transforms/scalar_constant_sinker.cc b/xla/service/gpu/transforms/scalar_constant_sinker.cc
+new file mode 100644
+index 0000000000000..946a8e7abe945
+--- /dev/null
++++ b/xla/service/gpu/transforms/scalar_constant_sinker.cc
+@@ -0,0 +1,71 @@
++/* Copyright 2025 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "xla/service/gpu/transforms/scalar_constant_sinker.h"
++
++#include <string>
++
++#include "absl/container/flat_hash_set.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/string_view.h"
++#include "xla/hlo/ir/hlo_computation.h"
++#include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/hlo/ir/hlo_opcode.h"
++#include "xla/tsl/platform/errors.h"
++
++namespace xla {
++namespace gpu {
++
++absl::StatusOr<bool> ScalarConstantSinker::Run(
++    HloModule* module,
++    const absl::flat_hash_set<absl::string_view>& execution_threads) {
++  bool changed = false;
++
++  for (HloComputation* computation : module->computations(execution_threads)) {
++    std::optional<HloInstruction*> maybe_fusion =
++        computation->GetUniqueCaller(HloOpcode::kFusion);
++    if (!maybe_fusion) {
++      continue;
++    }
++
++    const HloInstruction* fusion = *maybe_fusion;
++    if (fusion->IsCustomFusion()) {
++      continue;
++    }
++
++    for (int i = computation->num_parameters() - 1; i >= 0; --i) {
++      HloInstruction* param = computation->parameter_instruction(i);
++      if (!ShapeUtil::IsEffectiveScalar(param->shape())) {
++        continue;
++      }
++
++      const HloInstruction* operand = fusion->operand(i);
++      if (operand->opcode() != HloOpcode::kConstant) {
++        continue;
++      }
++
++      // Clone the constant into the fusion, replace all uses of the parameter
++      // and remove the parameter and the operand.
++      TF_RETURN_IF_ERROR(
++          computation->ReplaceWithNewInstruction(param, operand->Clone()));
++      changed = true;
++    }
++  }
++
++  return changed;
++}
++
++}  // namespace gpu
++}  // namespace xla
+diff --git a/xla/service/gpu/transforms/scalar_constant_sinker.h b/xla/service/gpu/transforms/scalar_constant_sinker.h
+new file mode 100644
+index 0000000000000..f3fffefb6854b
+--- /dev/null
++++ b/xla/service/gpu/transforms/scalar_constant_sinker.h
+@@ -0,0 +1,46 @@
++/* Copyright 2025 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#ifndef XLA_SERVICE_GPU_TRANSFORMS_SCALAR_CONSTANT_SINKER_H_
++#define XLA_SERVICE_GPU_TRANSFORMS_SCALAR_CONSTANT_SINKER_H_
++
++#include "absl/container/flat_hash_set.h"
++#include "absl/status/statusor.h"
++#include "absl/strings/string_view.h"
++#include "xla/hlo/ir/hlo_module.h"
++#include "xla/hlo/pass/hlo_pass_interface.h"
++
++namespace xla {
++namespace gpu {
++
++// Sinks scalar constants into fusions. Normally, such constants are always
++// fused (see priority_fusion), but it is possible for post-fusion passes to
++// create new unfused scalar constants. This is common in particular for passes
++// that modify while loops, e.g. by peeling them. The induction variable then
++// typically becomes an unfused scalar constant.
++class ScalarConstantSinker : public HloModulePass {
++ public:
++  absl::string_view name() const override { return "scalar-constant-sinker"; }
++
++  using HloPassInterface::Run;
++  absl::StatusOr<bool> Run(
++      HloModule* module,
++      const absl::flat_hash_set<absl::string_view>& execution_threads) override;
++};
++
++}  // namespace gpu
++}  // namespace xla
++
++#endif  // XLA_SERVICE_GPU_TRANSFORMS_SCALAR_CONSTANT_SINKER_H_
+diff --git a/xla/service/gpu/transforms/scalar_constant_sinker_test.cc b/xla/service/gpu/transforms/scalar_constant_sinker_test.cc
+new file mode 100644
+index 0000000000000..3040d84e6e695
+--- /dev/null
++++ b/xla/service/gpu/transforms/scalar_constant_sinker_test.cc
+@@ -0,0 +1,130 @@
++/* Copyright 2025 The OpenXLA Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++
++#include "xla/service/gpu/transforms/scalar_constant_sinker.h"
++
++#include <cstdint>
++#include <memory>
++#include <utility>
++
++#include "xla/hlo/ir/hlo_instruction.h"
++#include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
++#include "tsl/platform/statusor.h"
++#include "tsl/platform/test.h"
++
++namespace xla {
++namespace gpu {
++namespace {
++
++using ScalarConstantSinkerTest = HloHardwareIndependentTestBase;
++
++TEST_F(ScalarConstantSinkerTest, SinksScalars) {
++  RunAndFilecheckHloRewrite(R"(
++        // CHECK: fused_computation
++        fused_computation {
++          // CHECK-DAG: %[[P0:.*]] = s32[200,200,200,200]{3,2,1,0} parameter(0)
++          // CHECK-DAG: %[[P1:.*]] = s32[] parameter(1)
++          // CHECK-DAG: %[[P2:.*]] = s32[] parameter(2)
++          // CHECK-DAG: %[[C1:.*]] = s32[] constant(1)
++          // CHECK-DAG: %[[C2:.*]] = s32[] constant(2)
++          // CHECK: dynamic-slice(%[[P0]], %[[C2]], %[[P1]], %[[C1]], %[[P2]])
++          p0 = s32[200,200,200,200] parameter(0)
++          p1 = s32[] parameter(1)
++          p2 = s32[] parameter(2)
++          p3 = s32[] parameter(3)
++          p4 = s32[] parameter(4)
++          ROOT slice = s32[100,100,100,100] dynamic-slice(p0, p1, p2, p3, p4),
++              dynamic_slice_sizes={100,100,100,100}
++        }
++
++        // CHECK: ENTRY
++        ENTRY main {
++          // CHECK-DAG: %[[P0:.*]] = s32[200,200,200,200]{3,2,1,0} parameter(0)
++          // CHECK-DAG: %[[C1:.*]] = s32[] constant(1)
++          // CHECK-DAG: %[[P1:.*]] = s32[] parameter(1)
++          // CHECK-DAG: %[[P1P1:.*]] = s32[] add
++          p0 = s32[200,200,200,200] parameter(0)
++          c1 = s32[] constant(1)
++          c2 = s32[] constant(2)
++          p1 = s32[] parameter(1)
++          p1p1 = s32[] add(c1, p1)
++
++          // There should be only three parameters left.
++          // CHECK: fusion(%[[P0]], %[[P1P1]], %[[P1]])
++          ROOT fusion = s32[100,100,100,100] fusion(p0, c2, p1p1, c1, p1),
++              kind=kLoop, calls=fused_computation
++        })",
++                            ScalarConstantSinker());
++}
++
++TEST_F(ScalarConstantSinkerTest, DoesNotSinkTensors) {
++  constexpr char kHlo[] = R"(
++        fused_computation {
++          p0 = s32[2] parameter(0)
++          p1 = s32[] parameter(1)
++          ROOT slice = s32[1] dynamic-slice(p0, p1), dynamic_slice_sizes={1}
++        }
++
++        ENTRY main {
++          c0 = s32[2] constant({0,1})
++          p0 = s32[] parameter(0)
++          ROOT fusion = s32[1] fusion(c0, p0), kind=kLoop,
++              calls=fused_computation
++        })";
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(kHlo));
++  EXPECT_FALSE(ScalarConstantSinker().Run(module.get()).value());
++}
++
++TEST_F(ScalarConstantSinkerTest, DoesNotSinkIntoCustomFusions) {
++  constexpr char kHlo[] = R"(
++        fused_computation {
++          p0 = s32[] parameter(0)
++          p1 = s32[] parameter(1)
++          ROOT add = s32[] add(p0, p1)
++        }
++
++        ENTRY main {
++          c0 = s32[] constant(0)
++          c1 = s32[] constant(1)
++          ROOT fusion = s32[] fusion(c0, c1), kind=kCustom,
++              calls=fused_computation
++        })";
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(kHlo));
++  EXPECT_FALSE(ScalarConstantSinker().Run(module.get()).value());
++}
++
++TEST_F(ScalarConstantSinkerTest, DoesNotSinkIntoNonFusions) {
++  constexpr char kHlo[] = R"(
++        computation {
++          p0 = s32[] parameter(0)
++          p1 = s32[] parameter(1)
++          ROOT add = s32[] add(p0, p1)
++        }
++
++        ENTRY main {
++          c0 = s32[] constant(0)
++          c1 = s32[] constant(1)
++          ROOT fusion = s32[] call(c0, c1), to_apply=computation
++        })";
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(kHlo));
++  EXPECT_FALSE(ScalarConstantSinker().Run(module.get()).value());
++}
++
++}  // namespace
++}  // namespace gpu
++}  // namespace xla

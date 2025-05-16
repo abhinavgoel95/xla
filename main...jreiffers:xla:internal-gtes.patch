@@ -1,0 +1,383 @@
+From 767c831f844011b46c1e58316720b18a950fd3ad Mon Sep 17 00:00:00 2001
+From: Johannes Reifferscheid <jreiffers@nvidia.com>
+Date: Fri, 16 May 2025 12:49:57 +0200
+Subject: [PATCH] Allow internal tuples in
+ ResolveFunctionalDependencyOnInductionVariable.
+
+While loop double buffering commonly generates patterns like this:
+
+```
+ivar = s32[] gte(p0)
+tuple = (s32[], s32[]) fusion(ivar), calls=plus_one_and_plus_two
+ivar1 = s32[] gte(tuple)
+slice = ... dynamic-slice(..., ivar1)
+```
+
+Currently, this fails because of the internal GTE.
+---
+ xla/service/gpu/ir_emission_utils.cc      | 171 ++++++++++++++--------
+ xla/service/gpu/ir_emission_utils_test.cc | 116 +++++++++++++++
+ 2 files changed, 225 insertions(+), 62 deletions(-)
+
+diff --git a/xla/service/gpu/ir_emission_utils.cc b/xla/service/gpu/ir_emission_utils.cc
+index 185737a73618b..c6455b7c5118f 100644
+--- a/xla/service/gpu/ir_emission_utils.cc
++++ b/xla/service/gpu/ir_emission_utils.cc
+@@ -836,10 +836,16 @@ const HloInstruction* GetUniqueCallerOrNull(const HloComputation* callee) {
+   return callers.size() == 1 ? callers.front() : nullptr;
+ }
+ 
+-// Returns the transitive dependencies of `root`, including those of callers.
+-// Returns nullopt if any dependencies have side effects.
+-std::optional<absl::flat_hash_set<const HloInstruction*>>
+-GetTransitiveFunctionalDependencies(const HloInstruction* root) {
++struct Dependencies {
++  absl::InlinedVector<const HloInstruction*, 2> parameters;
++  absl::InlinedVector<const HloInstruction*, 1> get_tuple_elements;
++};
++
++// Returns the leaf dependencies of `root`, in each frame of the call stack.
++// Here, leaves are parameters and GTEs. Returns nullopt if any dependencies
++// have side effects.
++std::optional<Dependencies>
++GetLeafDependencies(const HloInstruction* root) {
+   absl::flat_hash_set<const HloInstruction*> seen{root};
+   std::queue<const HloInstruction*> queue;
+   queue.push(root);
+@@ -850,6 +856,7 @@ GetTransitiveFunctionalDependencies(const HloInstruction* root) {
+     }
+   };
+ 
++  Dependencies results;
+   while (!queue.empty()) {
+     const auto* instruction = queue.front();
+     VLOG(5) << "Visiting " << instruction->name() << ".";
+@@ -862,6 +869,7 @@ GetTransitiveFunctionalDependencies(const HloInstruction* root) {
+     }
+ 
+     if (instruction->opcode() == HloOpcode::kParameter) {
++      results.parameters.push_back(instruction);
+       const HloInstruction* caller =
+           GetUniqueCallerOrNull(instruction->parent());
+       if (!caller) {
+@@ -877,40 +885,83 @@ GetTransitiveFunctionalDependencies(const HloInstruction* root) {
+       }
+     }
+ 
++    if (instruction->opcode() == HloOpcode::kGetTupleElement) {
++      results.get_tuple_elements.push_back(instruction);
++    }
++
+     for (auto* operand : instruction->operands()) {
+       enqueue(operand);
+     }
+   }
+-
+-  return seen;
++  return results;
+ }
+ 
+-// Returns true if `dependency` contains a valid functional dependency: `loop`
+-// and `induction_var` are set, and `induction_var` actually points to the
+-// loop's induction variable.
+-bool VerifyFunctionalDependency(
+-    const InductionVariableFunctionalDependency& dependency) {
+-  if (!dependency.loop || !dependency.induction_var) {
+-    VLOG(5) << "Loop or induction variable not set.";
+-    return false;
++struct VerifiedLoop {
++  const HloInstruction* loop;
++  const HloInstruction* parameter;
++  int64_t induction_variable_index;
++};
++
++// Checks that `loop` is a while loop from which we can derive functional
++// dependencies.
++std::optional<VerifiedLoop> VerifyFunctionalDependencyLoop(
++    const HloInstruction* loop) {
++  if (!loop) {
++    VLOG(5) << "No loop found";
++    return std::nullopt;
+   }
+-
+-  if (dependency.induction_var->opcode() != HloOpcode::kGetTupleElement ||
+-      dependency.loop->while_body()->parameter_instruction(0) !=
+-          dependency.induction_var->operand(0)) {
+-    VLOG(5) << "induction_var does not point to the loop's parameter.";
+-    return false;
++  auto config = loop->backend_config<xla::WhileLoopBackendConfig>();
++  if (!config.ok() || !config->has_known_induction_variable()) {
++    VLOG(5) << "The loop has no known induction variable.";
++    return std::nullopt;
+   }
++  return VerifiedLoop{loop, loop->while_body()->parameter_instruction(0),
++                      config->known_induction_variable().tuple_index()};
++}
+ 
+-  auto config = dependency.loop->backend_config<xla::WhileLoopBackendConfig>();
+-  if (!config.ok() || !config->has_known_induction_variable() ||
+-      dependency.induction_var->tuple_index() !=
+-          config->known_induction_variable().tuple_index()) {
+-    VLOG(5) << "induction_var does not access the loop's induction variable.";
+-    return false;
+-  }
++// Returns true if `hlo` is a GTE for a loop carried variable of `loop`.
++bool IsLoopCarriedVariable(const HloInstruction* hlo,
++                           const VerifiedLoop& loop) {
++  return hlo->opcode() == HloOpcode::kGetTupleElement &&
++         hlo->operand(0) == loop.parameter;
++}
+ 
+-  return true;
++// Returns true if `maybe_variable` is `loop`'s induction variable.
++bool IsInductionVariable(const HloInstruction* maybe_variable,
++                         const VerifiedLoop& loop) {
++  return IsLoopCarriedVariable(maybe_variable, loop) &&
++         maybe_variable->tuple_index() == loop.induction_variable_index;
++}
++
++// Attempts to find the induction variable of `loop` in `dependencies`. If there
++// are any dependencies on non-induction variable loop-carried variables,
++// returns nullopt.
++std::optional<const HloInstruction*> VerifyInductionVariable(
++    const Dependencies& dependencies, const VerifiedLoop& loop) {
++  const HloInstruction* induction_var = nullptr;
++  for (const HloInstruction* gte : dependencies.get_tuple_elements) {
++    if (IsInductionVariable(gte, loop)) {
++      if (induction_var) {
++        // This should never happen.
++        VLOG(5) << "Found non-unique GTEs for the induction variable. Did "
++                   "HloCSE run?";
++        return std::nullopt;
++      }
++      induction_var = gte;
++    } else if (IsLoopCarriedVariable(gte, loop)) {
++      // Other dependencies on loop-carried variables are not allowed.
++      VLOG(5) << "Found illegal dependency on loop-carried variable.";
++      return std::nullopt;
++    }
++    // Other GTEs are OK, as long as their tuples are ultimately just derived
++    // from the loop's induction variable. We already verified that there are no
++    // side-effecting dependencies in GetLeafDependencies.
++  }
++  if (!induction_var) {
++    VLOG(5) << "Did not find an induction variable.";
++    return std::nullopt;
++  }
++  return induction_var;
+ }
+ 
+ }  // namespace
+@@ -919,7 +970,7 @@ std::optional<InductionVariableFunctionalDependency>
+ ResolveFunctionalDependencyOnInductionVariable(const HloInstruction* instr) {
+   VLOG(5) << "Looking for defining while loop of " << instr->name();
+ 
+-  auto dependencies = GetTransitiveFunctionalDependencies(instr);
++  auto dependencies = GetLeafDependencies(instr);
+   // If there is a side effect in the dependencies, the result will be nullopt.
+   if (!dependencies) {
+     return std::nullopt;
+@@ -929,47 +980,43 @@ ResolveFunctionalDependencyOnInductionVariable(const HloInstruction* instr) {
+   // and exactly one GTE for that parameter. We already verified that there are
+   // no side-effecting dependencies.
+   InductionVariableFunctionalDependency result{};
+-  for (const HloInstruction* dep : *dependencies) {
+-    if (dep->opcode() == HloOpcode::kParameter) {
+-      const HloComputation* callee = dep->parent();
+-      const HloInstruction* caller = GetUniqueCallerOrNull(callee);
+-      if (caller && IsCallLike(caller)) {
+-        // Register the parameter as a required intermediate value.
+-        auto& required = result.required_parameters[callee];
+-        if (required.empty()) {
+-          required.resize(callee->num_parameters());
+-        }
+-        required[dep->parameter_number()] = true;
+-      } else if (caller && caller->opcode() == HloOpcode::kWhile) {
+-        if (result.loop) {
+-          LOG(WARNING) << "While loop not unique. This should never happen.";
+-          return std::nullopt;
+-        }
+-        result.loop = caller;
+-      } else {
+-        // We arrived at an unexpected parameter. This likely means we're not in
+-        // a while loop, or there's an unsupported instruction between the while
+-        // loop and `instr`.
+-        VLOG(5) << "Unsupported parameter: " << dep->name() << ".";
+-        return std::nullopt;
++  for (const HloInstruction* param : dependencies->parameters) {
++    const HloComputation* callee = param->parent();
++    const HloInstruction* caller = GetUniqueCallerOrNull(callee);
++    if (caller && IsCallLike(caller)) {
++      // Register the parameter as a required intermediate value.
++      auto& required = result.required_parameters[callee];
++      if (required.empty()) {
++        required.resize(callee->num_parameters());
+       }
+-    }
+-
+-    if (dep->opcode() == HloOpcode::kGetTupleElement) {
+-      // Note that this may not actually be the induction variable. We will
+-      // verify this later (in VerifyFunctionalDependency). We can't do it here
+-      // because we may not have visited the loop yet.
+-      if (result.induction_var) {
+-        VLOG(5) << "Found non-unique GTEs.";
++      required[param->parameter_number()] = true;
++    } else if (caller && caller->opcode() == HloOpcode::kWhile) {
++      if (result.loop) {
++        LOG(WARNING) << "While loop not unique. This should never happen.";
+         return std::nullopt;
+       }
+-      result.induction_var = dep;
++      result.loop = caller;
++    } else {
++      // We arrived at an unexpected parameter. This likely means we're not in
++      // a while loop, or there's an unsupported instruction between the while
++      // loop and `instr`.
++      VLOG(5) << "Unsupported parameter: " << param->name() << ".";
++      return std::nullopt;
+     }
+   }
+ 
+-  if (!VerifyFunctionalDependency(result)) {
++  auto verified_loop = VerifyFunctionalDependencyLoop(result.loop);
++  if (!verified_loop) {
++    return std::nullopt;
++  }
++
++  auto induction_var = VerifyInductionVariable(*dependencies, *verified_loop);
++  if (induction_var) {
++    result.induction_var = *induction_var;
++  } else {
+     return std::nullopt;
+   }
++
+   VLOG(5) << "While loop for " << instr->name() << ": " << result.loop->name();
+   return result;
+ }
+diff --git a/xla/service/gpu/ir_emission_utils_test.cc b/xla/service/gpu/ir_emission_utils_test.cc
+index 10c36c85ccd0b..b57ab10b33d3a 100644
+--- a/xla/service/gpu/ir_emission_utils_test.cc
++++ b/xla/service/gpu/ir_emission_utils_test.cc
+@@ -1333,6 +1333,122 @@ TEST_F(IrEmissionUtilsTest, ResolveWhileLoopDependencySideEffect) {
+   ASSERT_FALSE(result.has_value());
+ }
+ 
++TEST_F(IrEmissionUtilsTest, InternalTuple) {
++  // Verifies that we can resolve dependencies that involve internal tuples.
++  constexpr absl::string_view kHlo = R"(
++      add12 {
++        p0 = s32[] parameter(0)
++        c1 = s32[] constant(1)
++        c2 = s32[] constant(2)
++        p0p1 = s32[] add(p0, c1)
++        p0p2 = s32[] add(p0, c2)
++        ROOT tuple = (s32[], s32[]) tuple(p0p1, p0p2)
++      }
++
++      call_body {
++        p0 = s32[] parameter(0)
++        ROOT sum = s32[] add(p0, p0)
++      }
++
++      while_body {
++        p0 = (s32[], s32[]) parameter(0)
++        ivar = s32[] get-tuple-element(p0), index=0
++        ivar_copy = s32[] copy(ivar)
++
++        side_effect = s32[] custom-call(), custom_call_target=""
++
++        derived = (s32[], s32[]) fusion(ivar_copy), kind=kLoop, calls=add12
++        val = get-tuple-element(derived), index=1
++
++        c1 = s32[] constant(1)
++        next_ivar = s32[] add(ivar_copy, c1)
++        use = s32[] call(val), to_apply=call_body
++
++        ROOT result = (s32[], s32[]) tuple(next_ivar, use)
++      }
++
++      condition {
++        p0 = (s32[], s32[]) parameter(0)
++        ivar = s32[] get-tuple-element(p0), index=0
++        c5 = s32[] constant(5)
++        ROOT cmp = pred[] compare(ivar, c5), direction=LT
++      }
++
++      ENTRY main {
++        c0 = s32[] constant(0)
++        tuple = (s32[], s32[]) tuple(c0, c0)
++        ROOT while = (s32[], s32[]) while(tuple),
++            condition=condition, body=while_body,
++            backend_config={"known_induction_variable":{"tuple_index":"0"}}
++      }
++  )";
++
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(kHlo));
++  auto result = ResolveFunctionalDependencyOnInductionVariable(
++      module->GetComputationWithName("call_body")->root_instruction());
++
++  ASSERT_TRUE(result.has_value());
++
++  HloComputation* while_body = module->GetComputationWithName("while_body");
++  const HloComputation* call_body = module->GetComputationWithName("call_body");
++  const HloInstruction* loop = module->entry_computation()->root_instruction();
++
++  EXPECT_EQ(result->loop, loop);
++  EXPECT_EQ(result->induction_var, while_body->GetInstructionWithName("ivar"));
++
++  EXPECT_THAT(result->required_parameters, SizeIs(1));
++  EXPECT_THAT(result->required_parameters[call_body], ElementsAre(true));
++}
++
++TEST_F(IrEmissionUtilsTest, NonInductionVariableLoopCarriedVariable) {
++  // Verifies that we detect when there is a dependency on a non-induction
++  // variable loop-carried variable.
++  constexpr absl::string_view kHlo = R"(
++      while_body {
++        p0 = (s32[], s32[]) parameter(0)
++        ivar = s32[] get-tuple-element(p0), index=0
++        lcv = s32[] get-tuple-element(p0), index=1
++
++        c1 = s32[] constant(1)
++        next_ivar = s32[] add(ivar, c1)
++        next_lcv = s32[] add(ivar, lcv)
++
++        ROOT result = (s32[], s32[]) tuple(next_ivar, next_lcv)
++      }
++
++      condition {
++        p0 = (s32[], s32[]) parameter(0)
++        ivar = s32[] get-tuple-element(p0), index=0
++        c5 = s32[] constant(5)
++        ROOT cmp = pred[] compare(ivar, c5), direction=LT
++      }
++
++      ENTRY main {
++        c0 = s32[] constant(0)
++        tuple = (s32[], s32[]) tuple(c0, c0)
++        ROOT while = (s32[], s32[]) while(tuple),
++            condition=condition, body=while_body,
++            backend_config={"known_induction_variable":{"tuple_index":"0"}}
++      }
++  )";
++
++  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
++                          ParseAndReturnVerifiedModule(kHlo));
++  HloComputation* while_body = module->GetComputationWithName("while_body");
++
++  // Sanity check to ensure there isn't something wrong with the loop.
++  ASSERT_TRUE(ResolveFunctionalDependencyOnInductionVariable(
++                  while_body->GetInstructionWithName("next_ivar"))
++                  .has_value());
++
++  // This must be false, since it depends on tuple index 1, which is not the
++  // induction variable.
++  ASSERT_FALSE(ResolveFunctionalDependencyOnInductionVariable(
++                   while_body->GetInstructionWithName("next_lcv"))
++                   .has_value());
++}
++
+ TEST_F(IrEmissionUtilsTest, Transpose_10) {
+   auto spec = GetTransposeSpecFromRoot(R"(ENTRY entry {
+     p0 = f32[8, 32] parameter(0)
