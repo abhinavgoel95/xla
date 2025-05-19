@@ -134,7 +134,7 @@ HloPassPipeline FusionDispatchPipeline(
   pipeline.AddPass<HloDCE>();
   pipeline.AddPass<FusionBlockLevelRewriter>(device_description, shape_size_fn,
                                              std::move(try_rewrite_fusion_if));
-  pipeline.AddPass<FusionDynamicMemcpyRewriter>();
+  //pipeline.AddPass<FusionDynamicMemcpyRewriter>();
   return pipeline;
 }
 
