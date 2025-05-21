@@ -304,7 +304,7 @@ absl::StatusOr<bool> FusionDynamicMemcpyRewriter::Run(
                         host_computation->CreateAsyncInstructions(
                             fusion_instr, /*instruction_to_wrap=*/
                             context_shapes,
-                            HloAsyncInstruction::DefaultExecutionThread(),
+                            HloInstruction::kMainExecutionThread,
                             /*replace=*/true));
     // CreateAsyncInstructions with replace=true handles replacing all uses
     // of fusion_instr with async_done_instr and moving fusion_instr
