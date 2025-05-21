@@ -286,26 +286,50 @@ absl::StatusOr<bool> FusionDynamicMemcpyRewriter::Run(
       memcpy_config->add_src_offset_bytes(descriptor->src_byte_static_offset);
       memcpy_config->add_dst_offset_bytes(descriptor->dst_byte_static_offset);
     } else {
+      VLOG(2) << "Attempting to set loop memcpy config for "
+              << fusion_instr->name();
       auto status = SetLoopMemcpyConfig(*descriptor, memcpy_config);
       if (!status.ok()) {
-        LOG(INFO) << "Failed to produce memcpy configuration: " << status;
+        LOG(INFO) << "Failed to produce memcpy configuration for "
+                  << fusion_instr->name() << ": " << status;
         continue;
       }
+      VLOG(2) << "Successfully set loop memcpy config for "
+              << fusion_instr->name();
     }
 
+    VLOG(2) << "Attempting to set backend config for " << fusion_instr->name();
     TF_RETURN_IF_ERROR(fusion_instr->set_backend_config(backend_config));
+    VLOG(2) << "Successfully set backend config for " << fusion_instr->name()
+            << ". New backend config: " << backend_config.DebugString();
+    VLOG(2) << "Fusion instruction state after backend config update: "
+            << fusion_instr->ToString();
     has_changed = true;
 
     // Now, make the fusion_instr asynchronous.
     // It lives in its parent computation.
     HloComputation* host_computation = fusion_instr->parent();
+    if (host_computation == nullptr) {
+      LOG(ERROR) << "Fusion instruction " << fusion_instr->name()
+                 << " has no parent computation.";
+      continue; // Or handle error appropriately
+    }
+    VLOG(2) << "Parent computation for " << fusion_instr->name() << " is "
+            << host_computation->name();
+    VLOG(2) << "Host computation state: " << host_computation->ToString();
+
     std::vector<Shape> context_shapes; // Typically empty for kFusion.
+    VLOG(2) << "Attempting to create async instructions for "
+            << fusion_instr->name();
     TF_ASSIGN_OR_RETURN(HloInstruction* async_done_instr,
                         host_computation->CreateAsyncInstructions(
                             fusion_instr, /*instruction_to_wrap=*/
                             context_shapes,
                             HloInstruction::kMainExecutionThread,
                             /*replace=*/true));
+    VLOG(2) << "Successfully created async instructions for "
+            << fusion_instr->name()
+            << ". Async done instruction: " << async_done_instr->name();
     // CreateAsyncInstructions with replace=true handles replacing all uses
     // of fusion_instr with async_done_instr and moving fusion_instr
     // into the async_start_instr. This also constitutes a change.
