@@ -266,16 +266,16 @@ absl::StatusOr<bool> FusionDynamicMemcpyRewriter::Run(
       continue;
     }
 
-    HloFusionInstruction* fusion =
+    HloFusionInstruction* fusion_instr =
         ::xla::Cast<HloFusionInstruction>(computation->FusionInstruction());
     auto descriptor =
-        DynamicMemcpyFusion::GetMemcpyDescriptorForFusion(*fusion);
+        DynamicMemcpyFusion::GetMemcpyDescriptorForFusion(*fusion_instr);
     if (!descriptor) {
       continue;
     }
 
     TF_ASSIGN_OR_RETURN(auto backend_config,
-                        fusion->backend_config<GpuBackendConfig>());
+                        fusion_instr->backend_config<GpuBackendConfig>());
     auto* fusion_config = backend_config.mutable_fusion_backend_config();
     fusion_config->set_kind(std::string(kDynamicMemcpyFusionKind));
     auto* memcpy_config = fusion_config->mutable_dynamic_memcpy_config();
@@ -293,8 +293,23 @@ absl::StatusOr<bool> FusionDynamicMemcpyRewriter::Run(
       }
     }
 
-    TF_RETURN_IF_ERROR(fusion->set_backend_config(backend_config));
+    TF_RETURN_IF_ERROR(fusion_instr->set_backend_config(backend_config));
     has_changed = true;
+
+    // Now, make the fusion_instr asynchronous.
+    // It lives in its parent computation.
+    HloComputation* host_computation = fusion_instr->parent();
+    std::vector<Shape> context_shapes; // Typically empty for kFusion.
+    TF_ASSIGN_OR_RETURN(HloInstruction* async_done_instr,
+                        host_computation->CreateAsyncInstructions(
+                            fusion_instr, /*instruction_to_wrap=*/
+                            context_shapes,
+                            HloAsyncInstruction::DefaultExecutionThread(),
+                            /*replace=*/true));
+    // CreateAsyncInstructions with replace=true handles replacing all uses
+    // of fusion_instr with async_done_instr and moving fusion_instr
+    // into the async_start_instr. This also constitutes a change.
+    // The 'has_changed' flag is already true from setting the backend config.
   }
 
   return has_changed;
