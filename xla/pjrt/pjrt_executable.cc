@@ -272,33 +272,33 @@ void CompiledMemoryStats::PopulateBufferStatsFromAllocations(
     // memory space of the underlying HLO value. Callers may choose other
     // colorers, however, e.g.:
     // https://github.com/openxla/xla/blob/50c6489cb058881cc65622605c9c55029abebc5b/xla/service/gpu/compile_module_to_llvm_ir.cc#L152
-    // Until buffer allocations provide a stronger guarantee about colors,
-    // we sanity-check that the default coloring behavior was used.
-    int64_t alloc_memory_space = -1;
+    // Here we sanity-check that either all or none of the values in a
+    // buffer allocation correspond to host memory.
+    std::optional<bool> is_host;
     for (const auto& [value, _] : alloc.assigned_buffers()) {
       const HloPosition& defining_position = value->defining_position();
-      int64_t memory_space = Layout::kDefaultMemorySpace;
+      bool value_is_host = false;
       if (defining_position.shape().has_layout()) {
-        memory_space = defining_position.shape().layout().memory_space();
+        value_is_host = defining_position.shape().layout().memory_space() ==
+          Layout::kHostMemorySpace;
       }
-      if (alloc_memory_space == -1) {
-        alloc_memory_space = memory_space;
+      if (is_host.has_value()) {
+        CHECK(*is_host == value_is_host &&
+          "expected allocation not to mix host and device memory buffers");
       } else {
-        CHECK(alloc_memory_space == memory_space &&
-              "expected same memory space for all assignments in allocation");
+        is_host = value_is_host;
       }
     }
 
-    bool is_host = alloc_memory_space == Layout::kHostMemorySpace;
     int64_t size = alloc.size();
     if (alloc.is_entry_computation_parameter()) {
-      if (is_host) {
+      if (*is_host) {
         host_argument_size_in_bytes += size;
       } else {
         argument_size_in_bytes += size;
       }
       if (alloc.is_parameter_aliased_with_output()) {
-        if (is_host) {
+        if (*is_host) {
           host_alias_size_in_bytes += size;
         } else {
           alias_size_in_bytes += size;
@@ -306,14 +306,14 @@ void CompiledMemoryStats::PopulateBufferStatsFromAllocations(
       }
     }
     if (alloc.maybe_live_out()) {
-      if (is_host) {
+      if (*is_host) {
         host_output_size_in_bytes += size;
       } else {
         output_size_in_bytes += size;
       }
     }
     if (alloc.IsPreallocatedTempBuffer()) {
-      if (is_host) {
+      if (*is_host) {
         host_temp_size_in_bytes += size;
       } else {
         temp_size_in_bytes += size;
@@ -794,3 +794,4 @@ absl::Status CompileOptions::ApplyOptionFromString(
 }
 
 }  // namespace xla
+
