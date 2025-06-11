@@ -1307,6 +1307,20 @@ absl::Status RunLayoutNormalizationPasses(
   return layout_normalization_pipeline.Run(hlo_module).status();
 }
 
+absl::Status RunAsyncDynamicSlicePasses(HloModule* hlo_module) {
+  tsl::profiler::TraceMe traceme("RunAsyncDynamicSlicePasses");
+  HloPassPipeline pipeline("async-wrapper");
+  const DebugOptions& debug_options = hlo_module->config().debug_options();
+  pipeline.AddPass<AsyncWrapper>([](HloInstruction* instruction) {
+    if (instruction->opcode() == HloOpcode::kDynamicSlice ||
+        instruction->opcode() == HloOpcode::kDynamicUpdateSlice) {
+      return true;
+    }
+    return false;
+  });
+  return pipeline.Run(hlo_module).status();
+}
+
 absl::Status RunAsyncDotPasses(HloModule* hlo_module) {
   tsl::profiler::TraceMe traceme("RunAsyncDotPasses");
   HloPassPipeline pipeline("async-wrapper");
@@ -1457,7 +1471,7 @@ absl::Status GpuCompiler::OptimizeHloModule(
 
   TF_RETURN_IF_ERROR(
       RunCollectiveScheduleLinearizerPasses(hlo_module, stream_exec));
-
+  TF_RETURN_IF_ERROR(RunAsyncDynamicSlicePasses(hlo_module));
   TF_RETURN_IF_ERROR(RunAsyncDotPasses(hlo_module));
 
   return absl::OkStatus();
