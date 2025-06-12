@@ -1429,6 +1429,7 @@ cc_library(
         "//xla:util",
         "//xla:xla_data_proto_cc",
         "//xla:xla_proto_cc",
+	"//xla/backends/gpu/codegen:copy",
         "//xla/backends/gpu/codegen/triton:support",
         "//xla/backends/gpu/runtime:thunk",
         "//xla/hlo/analysis:hlo_dataflow_analysis",

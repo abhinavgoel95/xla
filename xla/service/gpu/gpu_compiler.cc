@@ -60,6 +60,7 @@ limitations under the License.
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Support/LLVM.h"
+#include "xla/backends/gpu/codegen/copy.h"
 #include "xla/backends/gpu/codegen/triton/support.h"
 #include "xla/hlo/analysis/hlo_dataflow_analysis.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -1312,10 +1313,14 @@ absl::Status RunAsyncDynamicSlicePasses(HloModule* hlo_module) {
   HloPassPipeline pipeline("async-wrapper");
   const DebugOptions& debug_options = hlo_module->config().debug_options();
   pipeline.AddPass<AsyncWrapper>([](HloInstruction* instruction) {
-    if (instruction->opcode() == HloOpcode::kDynamicSlice ||
-        instruction->opcode() == HloOpcode::kDynamicUpdateSlice) {
-      return true;
+    if (instruction->opcode() == HloOpcode::kFusion) {
+      HloFusionInstruction* fusion =
+        ::xla::Cast<HloFusionInstruction>(instruction);
+      if (DynamicMemcpyFusion::GetMemcpyDescriptorForFusion(*fusion)) {
+        return true;
+      }
     }
+
     return false;
   });
   return pipeline.Run(hlo_module).status();
