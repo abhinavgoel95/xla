@@ -1,3 +1,16 @@
+diff --git a/shardy/dialect/sdy/ir/parsers.cc b/shardy/dialect/sdy/ir/parsers.cc
+index e7f0080..b4565c5 100644
+--- a/shardy/dialect/sdy/ir/parsers.cc
++++ b/shardy/dialect/sdy/ir/parsers.cc
+@@ -322,7 +322,7 @@ ParseResult parseFactorSizes(AsmParser& parser,
+       return failure();
+     }
+
+-    int factorSize;
++    int64_t factorSize;
+     if (parser.parseInteger(factorSize)) {
+       return failure();
+     }
 diff --git a/third_party/llvm/generated.patch b/third_party/llvm/generated.patch
 index 7e6fcd17..f27b558a 100644
 --- a/third_party/llvm/generated.patch
