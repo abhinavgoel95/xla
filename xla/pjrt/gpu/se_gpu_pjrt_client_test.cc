@@ -2005,11 +2005,11 @@ TEST(StreamExecutorGpuClientTest, DmaMapUnmap) {
                                     static_cast<std::align_val_t>(alignment));
       });
   TF_EXPECT_OK(client->DmaMap(host_dma_ptr, dma_size));
-  EXPECT_TRUE(client->IsDmaMapped(host_dma_ptr, dma_size));
-  EXPECT_FALSE(
-      client->IsDmaMapped(reinterpret_cast<char*>(host_dma_ptr) + 5, dma_size));
+  EXPECT_TRUE(client->IsHostMemoryPinned(host_dma_ptr, dma_size));
+  EXPECT_FALSE(client->IsHostMemoryPinned(
+      reinterpret_cast<char*>(host_dma_ptr) + 5, dma_size));
   TF_EXPECT_OK(client->DmaUnmap(host_dma_ptr));
-  EXPECT_FALSE(client->IsDmaMapped(host_dma_ptr, dma_size));
+  EXPECT_FALSE(client->IsHostMemoryPinned(host_dma_ptr, dma_size));
 }
 
 TEST(StreamExecutorGpuClientTest, RawBuffer) {
@@ -2491,9 +2491,13 @@ class ScopedBufferAllocatorVLog {
  public:
   ScopedBufferAllocatorVLog()
       : old_vlog_level_(
-            absl::SetVLogLevel("gpu_executable_buffer_allocator", 3)) {}
+            absl::SetVLogLevel("gpu_executable_buffer_allocator", 3)),
+        old_va_remap_vlog_level_(
+            absl::SetVLogLevel("gpu_executable_va_remap_allocator", 3)) {}
 
   ~ScopedBufferAllocatorVLog() {
+    absl::SetVLogLevel("gpu_executable_va_remap_allocator",
+                       old_va_remap_vlog_level_);
     absl::SetVLogLevel("gpu_executable_buffer_allocator", old_vlog_level_);
   }
 
@@ -2503,6 +2507,7 @@ class ScopedBufferAllocatorVLog {
 
  private:
   int old_vlog_level_;
+  int old_va_remap_vlog_level_;
 };
 
 TEST_F(VmmTest, CommandBufferSkipTempTwoGemmChain) {
